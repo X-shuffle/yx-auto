@@ -109,7 +109,119 @@ async function fetchAndParseWetest(url) {
     }
 }
 
-// 从GitHub获取优选IP
+// 整理成数组
+async function 整理成数组(内容) {
+    var 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
+    if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
+    if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
+    const 地址数组 = 替换后的内容.split(',');
+    return 地址数组;
+}
+
+// 请求优选API
+async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) {
+    if (!urls?.length) return [];
+    const results = new Set();
+    await Promise.allSettled(urls.map(async (url) => {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 超时时间);
+            const response = await fetch(url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+            let text = '';
+            try {
+                const buffer = await response.arrayBuffer();
+                const contentType = (response.headers.get('content-type') || '').toLowerCase();
+                const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
+
+                // 根据 Content-Type 响应头判断编码优先级
+                let decoders = ['utf-8', 'gb2312']; // 默认优先 UTF-8
+                if (charset.includes('gb') || charset.includes('gbk') || charset.includes('gb2312')) {
+                    decoders = ['gb2312', 'utf-8']; // 如果明确指定 GB 系编码，优先尝试 GB2312
+                }
+
+                // 尝试多种编码解码
+                let decodeSuccess = false;
+                for (const decoder of decoders) {
+                    try {
+                        const decoded = new TextDecoder(decoder).decode(buffer);
+                        // 验证解码结果的有效性
+                        if (decoded && decoded.length > 0 && !decoded.includes('\ufffd')) {
+                            text = decoded;
+                            decodeSuccess = true;
+                            break;
+                        } else if (decoded && decoded.length > 0) {
+                            // 如果有替换字符 (U+FFFD)，说明编码不匹配，继续尝试下一个编码
+                            continue;
+                        }
+                    } catch (e) {
+                        // 该编码解码失败，尝试下一个
+                        continue;
+                    }
+                }
+
+                // 如果所有编码都失败或无效，尝试 response.text()
+                if (!decodeSuccess) {
+                    text = await response.text();
+                }
+
+                // 如果返回的是空或无效数据，返回
+                if (!text || text.trim().length === 0) {
+                    return;
+                }
+            } catch (e) {
+                console.error('Failed to decode response:', e);
+                return;
+            }
+            const lines = text.trim().split('\n').map(l => l.trim()).filter(l => l);
+            const isCSV = lines.length > 1 && lines[0].includes(',');
+            const IPV6_PATTERN = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
+            if (!isCSV) {
+                lines.forEach(line => {
+                    const hashIndex = line.indexOf('#');
+                    const [hostPart, remark] = hashIndex > -1 ? [line.substring(0, hashIndex), line.substring(hashIndex)] : [line, ''];
+                    let hasPort = false;
+                    if (hostPart.startsWith('[')) {
+                        hasPort = /\]:(\d+)$/.test(hostPart);
+                    } else {
+                        const colonIndex = hostPart.lastIndexOf(':');
+                        hasPort = colonIndex > -1 && /^\d+$/.test(hostPart.substring(colonIndex + 1));
+                    }
+                    const port = new URL(url).searchParams.get('port') || 默认端口;
+                    results.add(hasPort ? line : `${hostPart}:${port}${remark}`);
+                });
+            } else {
+                const headers = lines[0].split(',').map(h => h.trim());
+                const dataLines = lines.slice(1);
+                if (headers.includes('IP地址') && headers.includes('端口') && headers.includes('数据中心')) {
+                    const ipIdx = headers.indexOf('IP地址'), portIdx = headers.indexOf('端口');
+                    const remarkIdx = headers.indexOf('国家') > -1 ? headers.indexOf('国家') :
+                        headers.indexOf('城市') > -1 ? headers.indexOf('城市') : headers.indexOf('数据中心');
+                    const tlsIdx = headers.indexOf('TLS');
+                    dataLines.forEach(line => {
+                        const cols = line.split(',').map(c => c.trim());
+                        if (tlsIdx !== -1 && cols[tlsIdx]?.toLowerCase() !== 'true') return;
+                        const wrappedIP = IPV6_PATTERN.test(cols[ipIdx]) ? `[${cols[ipIdx]}]` : cols[ipIdx];
+                        results.add(`${wrappedIP}:${cols[portIdx]}#${cols[remarkIdx]}`);
+                    });
+                } else if (headers.some(h => h.includes('IP')) && headers.some(h => h.includes('延迟')) && headers.some(h => h.includes('下载速度'))) {
+                    const ipIdx = headers.findIndex(h => h.includes('IP'));
+                    const delayIdx = headers.findIndex(h => h.includes('延迟'));
+                    const speedIdx = headers.findIndex(h => h.includes('下载速度'));
+                    const port = new URL(url).searchParams.get('port') || 默认端口;
+                    dataLines.forEach(line => {
+                        const cols = line.split(',').map(c => c.trim());
+                        const wrappedIP = IPV6_PATTERN.test(cols[ipIdx]) ? `[${cols[ipIdx]}]` : cols[ipIdx];
+                        results.add(`${wrappedIP}:${port}#CF优选 ${cols[delayIdx]}ms ${cols[speedIdx]}MB/s`);
+                    });
+                }
+            }
+        } catch (e) { }
+    }));
+    return Array.from(results);
+}
+
+// 从GitHub获取优选IP（保留原有功能，同时支持优选API）
 async function fetchAndParseNewIPs(piu) {
     const url = piu || defaultIPURL;
     try {
@@ -410,22 +522,105 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         }
     }
 
-    // GitHub优选
+    // GitHub优选 / 优选API
     if (egi) {
         try {
-            const newIPList = await fetchAndParseNewIPs(piu);
-            if (newIPList.length > 0) {
-                // 确保至少有一个协议被启用
-                const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                const useVL = hasProtocol ? evEnabled : true;  // 如果没有选择任何协议，默认使用VLESS
-                
-                if (useVL) {
-                    finalLinks.push(...generateLinksFromNewIPs(newIPList, user, nodeDomain, wsPath));
+            // 检查是否是优选API URL（以https://开头）
+            if (piu && piu.toLowerCase().startsWith('https://')) {
+                // 从优选API获取IP列表
+                const 优选API的IP = await 请求优选API([piu]);
+                if (优选API的IP && 优选API的IP.length > 0) {
+                    // 解析IP字符串格式：IP:端口#备注
+                    const IP列表 = 优选API的IP.map(原始地址 => {
+                        // 统一正则: 匹配 域名/IPv4/IPv6地址 + 可选端口 + 可选备注
+                        const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+                        const match = 原始地址.match(regex);
+
+                        if (match) {
+                            const 节点地址 = match[1].replace(/[\[\]]/g, ''); // 移除IPv6的方括号
+                            const 节点端口 = match[2] || 443;
+                            const 节点备注 = match[3] || 节点地址;
+                            return {
+                                ip: 节点地址,
+                                port: parseInt(节点端口),
+                                name: 节点备注
+                            };
+                        }
+                        return null;
+                    }).filter(item => item !== null);
+                    
+                    if (IP列表.length > 0) {
+                        const hasProtocol = evEnabled || etEnabled || vmEnabled;
+                        const useVL = hasProtocol ? evEnabled : true;
+                        
+                        if (useVL) {
+                            finalLinks.push(...generateLinksFromNewIPs(IP列表, user, nodeDomain, wsPath));
+                        }
+                    }
                 }
-                // GitHub IP只支持VLESS格式
+            } else if (piu && piu.includes('\n')) {
+                // 支持多行文本，包含混合格式（优选API URL + IP列表）
+                const 完整优选列表 = await 整理成数组(piu);
+                const 优选API = [], 优选IP = [], 其他节点 = [];
+                
+                for (const 元素 of 完整优选列表) {
+                    if (元素.toLowerCase().startsWith('https://')) {
+                        优选API.push(元素);
+                    } else if (元素.toLowerCase().includes('://')) {
+                        其他节点.push(元素);
+                    } else {
+                        优选IP.push(元素);
+                    }
+                }
+                
+                // 从优选API获取IP
+                if (优选API.length > 0) {
+                    const 优选API的IP = await 请求优选API(优选API);
+                    优选IP.push(...优选API的IP);
+                }
+                
+                // 解析所有IP并生成节点
+                if (优选IP.length > 0) {
+                    const IP列表 = 优选IP.map(原始地址 => {
+                        const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+                        const match = 原始地址.match(regex);
+
+                        if (match) {
+                            const 节点地址 = match[1].replace(/[\[\]]/g, '');
+                            const 节点端口 = match[2] || 443;
+                            const 节点备注 = match[3] || 节点地址;
+                            return {
+                                ip: 节点地址,
+                                port: parseInt(节点端口),
+                                name: 节点备注
+                            };
+                        }
+                        return null;
+                    }).filter(item => item !== null);
+                    
+                    if (IP列表.length > 0) {
+                        const hasProtocol = evEnabled || etEnabled || vmEnabled;
+                        const useVL = hasProtocol ? evEnabled : true;
+                        
+                        if (useVL) {
+                            finalLinks.push(...generateLinksFromNewIPs(IP列表, user, nodeDomain, wsPath));
+                        }
+                    }
+                }
+            } else {
+                // 原有的GitHub优选逻辑（单URL）
+                const newIPList = await fetchAndParseNewIPs(piu);
+                if (newIPList.length > 0) {
+                    const hasProtocol = evEnabled || etEnabled || vmEnabled;
+                    const useVL = hasProtocol ? evEnabled : true;
+                    
+                    if (useVL) {
+                        finalLinks.push(...generateLinksFromNewIPs(newIPList, user, nodeDomain, wsPath));
+                    }
+                }
             }
         } catch (error) {
-            console.error('获取GitHub IP失败:', error);
+            console.error('获取优选IP失败:', error);
         }
     }
 
@@ -530,6 +725,140 @@ function generateSurgeConfig(links) {
 // 生成Quantumult配置
 function generateQuantumultConfig(links) {
     return btoa(links.join('\n'));
+}
+
+// 在线测试延迟 - 测试IP或域名的延迟
+async function testLatency(host, port = 443, timeout = 5000) {
+    const startTime = Date.now();
+    try {
+        // 解析地址和端口
+        let testHost = host;
+        let testPort = port;
+        
+        // 如果host包含端口，提取出来
+        if (host.includes(':')) {
+            const parts = host.split(':');
+            testHost = parts[0].replace(/[\[\]]/g, ''); // 移除IPv6的方括号
+            testPort = parseInt(parts[1]) || port;
+        }
+        
+        // 构建测试URL
+        const protocol = testPort === 443 || testPort === 8443 ? 'https' : 'http';
+        const testUrl = `${protocol}://${testHost}:${testPort}/cdn-cgi/trace`;
+        
+        // 使用AbortController控制超时
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
+        try {
+            const response = await fetch(testUrl, {
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            });
+            
+            clearTimeout(timeoutId);
+            
+            const responseTime = Date.now() - startTime;
+            
+            if (response.ok) {
+                const text = await response.text();
+                const ipMatch = text.match(/ip=([^\s]+)/);
+                const locMatch = text.match(/loc=([^\s]+)/);
+                const coloMatch = text.match(/colo=([^\s]+)/);
+                
+                return {
+                    success: true,
+                    host: host,
+                    port: testPort,
+                    latency: responseTime,
+                    ip: ipMatch ? ipMatch[1] : null,
+                    location: locMatch ? locMatch[1] : null,
+                    colo: coloMatch ? coloMatch[1] : null
+                };
+            } else {
+                return {
+                    success: false,
+                    host: host,
+                    port: testPort,
+                    latency: responseTime,
+                    error: `HTTP ${response.status}`
+                };
+            }
+        } catch (fetchError) {
+            clearTimeout(timeoutId);
+            const responseTime = Date.now() - startTime;
+            
+            if (fetchError.name === 'AbortError') {
+                return {
+                    success: false,
+                    host: host,
+                    port: testPort,
+                    latency: timeout,
+                    error: '请求超时'
+                };
+            }
+            
+            return {
+                success: false,
+                host: host,
+                port: testPort,
+                latency: responseTime,
+                error: fetchError.message || '连接失败'
+            };
+        }
+    } catch (error) {
+        const responseTime = Date.now() - startTime;
+        return {
+            success: false,
+            host: host,
+            port: port,
+            latency: responseTime,
+            error: error.message || '未知错误'
+        };
+    }
+}
+
+// 批量测试延迟
+async function batchTestLatency(hosts, port = 443, timeout = 5000, concurrency = 5) {
+    const results = [];
+    const chunks = [];
+    
+    // 将hosts分成多个批次
+    for (let i = 0; i < hosts.length; i += concurrency) {
+        chunks.push(hosts.slice(i, i + concurrency));
+    }
+    
+    // 按批次测试
+    for (const chunk of chunks) {
+        const chunkResults = await Promise.allSettled(
+            chunk.map(host => testLatency(host, port, timeout))
+        );
+        
+        chunkResults.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                results.push(result.value);
+            } else {
+                results.push({
+                    success: false,
+                    host: chunk[index],
+                    port: port,
+                    latency: timeout,
+                    error: result.reason?.message || '测试失败'
+                });
+            }
+        });
+    }
+    
+    // 按延迟排序
+    results.sort((a, b) => {
+        if (a.success && !b.success) return -1;
+        if (!a.success && b.success) return 1;
+        return a.latency - b.latency;
+    });
+    
+    return results;
 }
 
 // 生成iOS 26风格的主页
@@ -867,6 +1196,23 @@ function generateHomePage(scuValue) {
             .footer a {
                 color: #5ac8fa !important;
             }
+            
+            textarea {
+                background: rgba(142, 142, 147, 0.2) !important;
+                color: #f5f5f7 !important;
+            }
+            
+            textarea::placeholder {
+                color: #86868b !important;
+            }
+            
+            #testResult, #batchTestResult {
+                color: #f5f5f7 !important;
+            }
+            
+            #testResult div, #batchTestResult div {
+                color: #f5f5f7 !important;
+            }
         }
     </style>
 </head>
@@ -987,6 +1333,30 @@ function generateHomePage(scuValue) {
                 <div class="switch" id="switchTLS" onclick="toggleSwitch('switchTLS')"></div>
             </div>
             <small style="display: block; margin-top: -12px; margin-bottom: 12px; color: #86868b; font-size: 13px; padding-left: 0;">启用后只生成带TLS的节点，不生成非TLS节点（如80端口）</small>
+        </div>
+        
+        <div class="card" style="margin-top: 16px;">
+            <div class="form-group">
+                <label>在线延迟测试</label>
+                <input type="text" id="testHost" placeholder="输入IP或域名，例如: 1.1.1.1 或 example.com" style="margin-bottom: 12px;">
+                <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+                    <input type="number" id="testPort" placeholder="端口" value="443" style="flex: 1; min-width: 0;">
+                    <input type="number" id="testTimeout" placeholder="超时(ms)" value="5000" style="flex: 1; min-width: 0;">
+                </div>
+                <button type="button" class="btn btn-secondary" onclick="testSingleLatency()" id="testBtn" style="margin-top: 0;">测试延迟</button>
+                <div id="testResult" style="display: none; margin-top: 12px; padding: 12px; background: rgba(142, 142, 147, 0.12); border-radius: 8px; font-size: 14px;"></div>
+            </div>
+            
+            <div class="form-group" style="margin-top: 24px;">
+                <label>批量测试延迟</label>
+                <textarea id="batchTestHosts" placeholder="每行一个IP或域名，例如：&#10;1.1.1.1&#10;1.0.0.1&#10;example.com" style="width: 100%; padding: 14px 16px; font-size: 15px; font-weight: 400; color: #1d1d1f; background: rgba(142, 142, 147, 0.12); border: none; border-radius: 12px; outline: none; resize: vertical; min-height: 100px; font-family: inherit;"></textarea>
+                <div style="display: flex; gap: 10px; margin-top: 12px;">
+                    <input type="number" id="batchTestPort" placeholder="端口" value="443" style="flex: 1; min-width: 0;">
+                    <input type="number" id="batchTestTimeout" placeholder="超时(ms)" value="5000" style="flex: 1; min-width: 0;">
+                </div>
+                <button type="button" class="btn btn-secondary" onclick="testBatchLatency()" id="batchTestBtn" style="margin-top: 12px;">批量测试</button>
+                <div id="batchTestResult" style="display: none; margin-top: 12px; max-height: 400px; overflow-y: auto;"></div>
+            </div>
         </div>
         
         <div class="footer">
@@ -1200,6 +1570,174 @@ function generateHomePage(scuValue) {
                 }
             }
         }
+        
+        // 单个延迟测试
+        async function testSingleLatency() {
+            const host = document.getElementById('testHost').value.trim();
+            const port = parseInt(document.getElementById('testPort').value) || 443;
+            const timeout = parseInt(document.getElementById('testTimeout').value) || 5000;
+            const testBtn = document.getElementById('testBtn');
+            const testResult = document.getElementById('testResult');
+            
+            if (!host) {
+                alert('请输入要测试的IP或域名');
+                return;
+            }
+            
+            testBtn.disabled = true;
+            testBtn.textContent = '测试中...';
+            testResult.style.display = 'none';
+            
+            try {
+                const currentUrl = new URL(window.location.href);
+                const baseUrl = currentUrl.origin;
+                const testUrl = \`\${baseUrl}/test?host=\${encodeURIComponent(host)}&port=\${port}&timeout=\${timeout}\`;
+                
+                const response = await fetch(testUrl);
+                const result = await response.json();
+                
+                testResult.style.display = 'block';
+                
+                if (result.success) {
+                    testResult.innerHTML = \`
+                        <div style="color: #34c759; font-weight: 600; margin-bottom: 8px;">✓ 测试成功</div>
+                        <div style="color: #1d1d1f; margin-bottom: 4px;"><strong>延迟:</strong> \${result.latency}ms</div>
+                        \${result.ip ? \`<div style="color: #1d1d1f; margin-bottom: 4px;"><strong>IP:</strong> \${result.ip}</div>\` : ''}
+                        \${result.location ? \`<div style="color: #1d1d1f; margin-bottom: 4px;"><strong>位置:</strong> \${result.location}</div>\` : ''}
+                        \${result.colo ? \`<div style="color: #1d1d1f;"><strong>数据中心:</strong> \${result.colo}</div>\` : ''}
+                    \`;
+                    testResult.style.background = 'rgba(52, 199, 89, 0.1)';
+                } else {
+                    testResult.innerHTML = \`
+                        <div style="color: #ff3b30; font-weight: 600; margin-bottom: 8px;">✗ 测试失败</div>
+                        <div style="color: #1d1d1f; margin-bottom: 4px;"><strong>延迟:</strong> \${result.latency}ms</div>
+                        <div style="color: #1d1d1f;"><strong>错误:</strong> \${result.error || '未知错误'}</div>
+                    \`;
+                    testResult.style.background = 'rgba(255, 59, 48, 0.1)';
+                }
+            } catch (error) {
+                testResult.style.display = 'block';
+                testResult.innerHTML = \`
+                    <div style="color: #ff3b30; font-weight: 600;">✗ 测试失败</div>
+                    <div style="color: #1d1d1f; margin-top: 4px;">\${error.message || '网络错误'}</div>
+                \`;
+                testResult.style.background = 'rgba(255, 59, 48, 0.1)';
+            } finally {
+                testBtn.disabled = false;
+                testBtn.textContent = '测试延迟';
+            }
+        }
+        
+        // 批量延迟测试
+        async function testBatchLatency() {
+            const hostsText = document.getElementById('batchTestHosts').value.trim();
+            const port = parseInt(document.getElementById('batchTestPort').value) || 443;
+            const timeout = parseInt(document.getElementById('batchTestTimeout').value) || 5000;
+            const batchTestBtn = document.getElementById('batchTestBtn');
+            const batchTestResult = document.getElementById('batchTestResult');
+            
+            if (!hostsText) {
+                alert('请输入要测试的IP或域名列表');
+                return;
+            }
+            
+            const hosts = hostsText.split('\\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0);
+            
+            if (hosts.length === 0) {
+                alert('请输入至少一个IP或域名');
+                return;
+            }
+            
+            batchTestBtn.disabled = true;
+            batchTestBtn.textContent = \`测试中... (0/\${hosts.length})\`;
+            batchTestResult.style.display = 'none';
+            batchTestResult.innerHTML = '';
+            
+            try {
+                const currentUrl = new URL(window.location.href);
+                const baseUrl = currentUrl.origin;
+                
+                const response = await fetch(\`\${baseUrl}/batch-test\`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        hosts: hosts,
+                        port: port,
+                        timeout: timeout,
+                        concurrency: 5
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    batchTestResult.style.display = 'block';
+                    let html = \`
+                        <div style="padding: 12px; background: rgba(142, 142, 147, 0.12); border-radius: 8px; margin-bottom: 12px;">
+                            <div style="font-weight: 600; margin-bottom: 4px;">测试完成</div>
+                            <div style="font-size: 13px; color: #86868b;">成功: \${data.successCount} / 总计: \${data.total}</div>
+                        </div>
+                    \`;
+                    
+                    data.results.forEach((result, index) => {
+                        const bgColor = result.success ? 'rgba(52, 199, 89, 0.1)' : 'rgba(255, 59, 48, 0.1)';
+                        const statusColor = result.success ? '#34c759' : '#ff3b30';
+                        const statusText = result.success ? '✓' : '✗';
+                        
+                        html += \`
+                            <div style="padding: 12px; background: \${bgColor}; border-radius: 8px; margin-bottom: 8px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                    <div style="font-weight: 600; color: \${statusColor};">\${statusText} \${result.host}:\${result.port}</div>
+                                    <div style="font-weight: 600; color: #1d1d1f;">\${result.latency}ms</div>
+                                </div>
+                                \${result.success ? \`
+                                    \${result.ip ? \`<div style="font-size: 13px; color: #86868b;">IP: \${result.ip}</div>\` : ''}
+                                    \${result.location ? \`<div style="font-size: 13px; color: #86868b;">位置: \${result.location}</div>\` : ''}
+                                    \${result.colo ? \`<div style="font-size: 13px; color: #86868b;">数据中心: \${result.colo}</div>\` : ''}
+                                \` : \`
+                                    <div style="font-size: 13px; color: #ff3b30;">错误: \${result.error || '未知错误'}</div>
+                                \`}
+                            </div>
+                        \`;
+                    });
+                    
+                    batchTestResult.innerHTML = html;
+                } else {
+                    batchTestResult.style.display = 'block';
+                    batchTestResult.innerHTML = \`
+                        <div style="padding: 12px; background: rgba(255, 59, 48, 0.1); border-radius: 8px; color: #ff3b30;">
+                            测试失败: \${data.error || '未知错误'}
+                        </div>
+                    \`;
+                }
+            } catch (error) {
+                batchTestResult.style.display = 'block';
+                batchTestResult.innerHTML = \`
+                    <div style="padding: 12px; background: rgba(255, 59, 48, 0.1); border-radius: 8px; color: #ff3b30;">
+                        网络错误: \${error.message || '未知错误'}
+                    </div>
+                \`;
+            } finally {
+                batchTestBtn.disabled = false;
+                batchTestBtn.textContent = '批量测试';
+            }
+        }
+        
+        // 支持回车键触发测试
+        document.addEventListener('DOMContentLoaded', function() {
+            const testHostInput = document.getElementById('testHost');
+            if (testHostInput) {
+                testHostInput.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        testSingleLatency();
+                    }
+                });
+            }
+        });
     </script>
 </body>
 </html>`;
@@ -1217,6 +1755,149 @@ export default {
             return new Response(generateHomePage(scuValue), {
                 headers: { 'Content-Type': 'text/html; charset=utf-8' }
             });
+        }
+        
+        // 在线测试延迟 API: /test?host=xxx&port=443
+        if (path === '/test') {
+            const host = url.searchParams.get('host');
+            const port = parseInt(url.searchParams.get('port') || '443');
+            const timeout = parseInt(url.searchParams.get('timeout') || '5000');
+            
+            if (!host) {
+                return new Response(JSON.stringify({ 
+                    success: false, 
+                    error: '缺少host参数' 
+                }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                });
+            }
+            
+            const result = await testLatency(host, port, timeout);
+            return new Response(JSON.stringify(result, null, 2), {
+                headers: { 
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            });
+        }
+        
+        // 批量测试延迟 API: /batch-test
+        if (path === '/batch-test') {
+            if (request.method === 'OPTIONS') {
+                return new Response(null, {
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type'
+                    }
+                });
+            }
+            
+            if (request.method === 'POST') {
+                try {
+                    const body = await request.json();
+                    const hosts = body.hosts || [];
+                    const port = parseInt(body.port || '443');
+                    const timeout = parseInt(body.timeout || '5000');
+                    const concurrency = parseInt(body.concurrency || '5');
+                    
+                    if (!Array.isArray(hosts) || hosts.length === 0) {
+                        return new Response(JSON.stringify({ 
+                            success: false, 
+                            error: 'hosts必须是非空数组' 
+                        }), {
+                            status: 400,
+                            headers: { 
+                                'Content-Type': 'application/json; charset=utf-8',
+                                'Access-Control-Allow-Origin': '*'
+                            }
+                        });
+                    }
+                    
+                    const results = await batchTestLatency(hosts, port, timeout, concurrency);
+                    return new Response(JSON.stringify({ 
+                        success: true, 
+                        results: results,
+                        total: results.length,
+                        successCount: results.filter(r => r.success).length
+                    }, null, 2), {
+                        headers: { 
+                            'Content-Type': 'application/json; charset=utf-8',
+                            'Access-Control-Allow-Origin': '*'
+                        }
+                    });
+                } catch (error) {
+                    return new Response(JSON.stringify({ 
+                        success: false, 
+                        error: error.message 
+                    }), {
+                        status: 500,
+                        headers: { 
+                            'Content-Type': 'application/json; charset=utf-8',
+                            'Access-Control-Allow-Origin': '*'
+                        }
+                    });
+                }
+            }
+        }
+        
+        // 测试优选API API: /test-optimize-api?url=xxx&port=443
+        if (path === '/test-optimize-api') {
+            if (request.method === 'OPTIONS') {
+                return new Response(null, {
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type'
+                    }
+                });
+            }
+            
+            const apiUrl = url.searchParams.get('url');
+            const port = url.searchParams.get('port') || '443';
+            const timeout = parseInt(url.searchParams.get('timeout') || '3000');
+            
+            if (!apiUrl) {
+                return new Response(JSON.stringify({ 
+                    success: false, 
+                    error: '缺少url参数' 
+                }), {
+                    status: 400,
+                    headers: { 
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                });
+            }
+            
+            try {
+                const results = await 请求优选API([apiUrl], port, timeout);
+                return new Response(JSON.stringify({ 
+                    success: true, 
+                    results: results,
+                    total: results.length,
+                    message: `成功获取 ${results.length} 个优选IP`
+                }, null, 2), {
+                    headers: { 
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                });
+            } catch (error) {
+                return new Response(JSON.stringify({ 
+                    success: false, 
+                    error: error.message 
+                }), {
+                    status: 500,
+                    headers: { 
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                });
+            }
         }
         
         // 订阅请求格式: /{UUID}/sub?domain=xxx&epd=yes&epi=yes&egi=yes
